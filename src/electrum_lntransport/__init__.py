@@ -3,8 +3,19 @@
 __author__ = """The Electrum Developers"""
 __version__ = '0.0.1'
 
-from .util import LNPeerAddr, split_host_port
-from .lntransport import LNClient, LNTransport, create_bolt8_server
+from .lntransport import (
+    LNClient,
+    LNTransport,
+    HandshakeFailed,
+    LightningPeerConnectionClosed,
+    create_bolt8_server,
+)
+from .util import (
+    LNPeerAddr,
+    ConnStringFormatError,
+    split_host_port,
+    extract_nodeid,
+)
 
 __all__ = [
     'LNPeerAddr',
@@ -12,4 +23,8 @@ __all__ = [
     'LNClient',
     'LNTransport',
     'create_bolt8_server',
+    'ConnStringFormatError',
+    'LightningPeerConnectionClosed',
+    'HandshakeFailed',
+    'extract_nodeid',
 ]
