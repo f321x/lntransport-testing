@@ -1,0 +1,13 @@
+.idea/
+dist/
+build/
+*.egg-info/
+env/
+**/*.pyc
+.coverage
+
+# shared objects
+**/*.so
+**/*.so.*
+**/*.dll
+**/*.dylib
