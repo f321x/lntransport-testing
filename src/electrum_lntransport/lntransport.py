@@ -5,24 +5,23 @@
 
 # Derived from https://gist.github.com/AdamISZ/046d05c156aaeb56cc897f85eecb3eb8
 
-import re
 import hashlib
 import asyncio
-from asyncio import Queue
+from asyncio import Queue, StreamReader, StreamWriter
 
 from functools import cached_property, partial
-from typing import Tuple, Optional
+from typing import Optional
 
-from aiorpcx.util import NetAddress
 from aiorpcx.session import SessionKind, SessionBase
 from aiorpcx.framing import FramerBase
 from aiorpcx.rawsocket import RSTransport
 
 import electrum_ecc as ecc
 
-from .crypto import sha256, hmac_oneshot, chacha20_poly1305_encrypt, chacha20_poly1305_decrypt
-from .crypto import get_ecdh, privkey_to_pubkey
-from .util import log_exceptions
+from .crypto import (sha256, hmac_oneshot, get_ecdh, privkey_to_pubkey, create_ephemeral_key,
+                     aead_encrypt, aead_decrypt)
+from .util import log_exceptions, LNPeerAddr, ESocksProxy
+
 
 class QueueFramer(FramerBase):
 
@@ -49,7 +48,6 @@ class LNSession(SessionBase):
 
 class LightningPeerConnectionClosed(Exception): pass
 class HandshakeFailed(Exception): pass
-class ConnStringFormatError(Exception): pass
 
 class HandshakeState(object):
     protocol_name = b"Noise_XK_secp256k1_ChaChaPoly_SHA256"
@@ -67,25 +65,6 @@ class HandshakeState(object):
         self.h = sha256(self.h + data)
         return self.h
 
-def get_nonce_bytes(n):
-    """BOLT 8 requires the nonce to be 12 bytes, 4 bytes leading
-    zeroes and 8 bytes little endian encoded 64-bit integer.
-    """
-    return b"\x00"*4 + n.to_bytes(8, 'little')
-
-def aead_encrypt(key: bytes, nonce: int, associated_data: bytes, data: bytes) -> bytes:
-    nonce_bytes = get_nonce_bytes(nonce)
-    return chacha20_poly1305_encrypt(key=key,
-                                     nonce=nonce_bytes,
-                                     associated_data=associated_data,
-                                     data=data)
-
-def aead_decrypt(key: bytes, nonce: int, associated_data: bytes, data: bytes) -> bytes:
-    nonce_bytes = get_nonce_bytes(nonce)
-    return chacha20_poly1305_decrypt(key=key,
-                                     nonce=nonce_bytes,
-                                     associated_data=associated_data,
-                                     data=data)
 
 def get_bolt8_hkdf(salt, ikm):
     """RFC5869 HKDF instantiated in the specific form
@@ -105,6 +84,7 @@ def get_bolt8_hkdf(salt, ikm):
     assert len(T1 + T2) == 64
     return T1, T2
 
+
 def act1_initiator_message(hs, epriv, epub):
     ss = get_ecdh(epriv, hs.responder_pub)
     ck2, temp_k1 = get_bolt8_hkdf(hs.ck, ss)
@@ -117,121 +97,32 @@ def act1_initiator_message(hs, epriv, epub):
     return msg, temp_k1
 
 
-def create_ephemeral_key() -> (bytes, bytes):
-    privkey = ecc.ECPrivkey.generate_random_key()
-    return privkey.get_secret_bytes(), privkey.get_public_key_bytes()
-
-
-def split_host_port(host_port: str) -> Tuple[str, str]: # port returned as string
-    ipv6  = re.compile(r'\[(?P<host>[:0-9a-f]+)\](?P<port>:\d+)?$')
-    other = re.compile(r'(?P<host>[^:]+)(?P<port>:\d+)?$')
-    m = ipv6.match(host_port)
-    if not m:
-        m = other.match(host_port)
-    if not m:
-        raise ConnStringFormatError('Connection strings must be in <node_pubkey>@<host>:<port> format')
-    host = m.group('host')
-    if m.group('port'):
-        port = m.group('port')[1:]
-    else:
-        port = '9735'
-    try:
-        int(port)
-    except ValueError:
-        raise ConnStringFormatError('Port number must be decimal')
-    return host, port
-
-def extract_nodeid(connect_contents: str) -> Tuple[bytes, Optional[str]]:
-    """Takes a connection-string-like str, and returns a tuple (node_id, rest),
-    where rest is typically a host (with maybe port). Examples:
-    - extract_nodeid(pubkey@host:port) == (pubkey, host:port)
-    - extract_nodeid(pubkey@host) == (pubkey, host)
-    - extract_nodeid(pubkey) == (pubkey, None)
-    Can raise ConnStringFormatError.
-    """
-    rest = None
-    try:
-        # connection string?
-        nodeid_hex, rest = connect_contents.split("@", 1)
-    except ValueError:
-        # node id as hex?
-        nodeid_hex = connect_contents
-    if rest == '':
-        raise ConnStringFormatError('At least a hostname must be supplied after the at symbol.')
-    try:
-        node_id = bytes.fromhex(nodeid_hex)
-        if len(node_id) != 33:
-            raise Exception()
-    except Exception:
-        raise ConnStringFormatError('Invalid node ID, must be 33 bytes and hexadecimal')
-    return node_id, rest
-
-class LNPeerAddr:
-    # note: while not programmatically enforced, this class is meant to be *immutable*
-
-    def __init__(self, host: str, port: int, pubkey: bytes):
-        assert isinstance(host, str), repr(host)
-        assert isinstance(port, int), repr(port)
-        assert isinstance(pubkey, bytes), repr(pubkey)
-        try:
-            net_addr = NetAddress(host, port)  # this validates host and port
-        except Exception as e:
-            raise ValueError(f"cannot construct LNPeerAddr: invalid host or port (host={host}, port={port})") from e
-        # note: not validating pubkey as it would be too expensive:
-        # if not ECPubkey.is_pubkey_bytes(pubkey): raise ValueError()
-        self.host = host
-        self.port = port
-        self.pubkey = pubkey
-        self._net_addr = net_addr
-
-    def __str__(self):
-        return '{}@{}'.format(self.pubkey.hex(), self.net_addr_str())
-
-    @classmethod
-    def from_str(cls, s):
-        node_id, rest = extract_nodeid(s)
-        host, port = split_host_port(rest)
-        return LNPeerAddr(host, int(port), node_id)
-
-    def __repr__(self):
-        return f'<LNPeerAddr host={self.host} port={self.port} pubkey={self.pubkey.hex()}>'
-
-    def net_addr(self) -> NetAddress:
-        return self._net_addr
-
-    def net_addr_str(self) -> str:
-        return str(self._net_addr)
-
-    def __eq__(self, other):
-        if not isinstance(other, LNPeerAddr):
-            return False
-        return (self.host == other.host
-                and self.port == other.port
-                and self.pubkey == other.pubkey)
-
-    def __ne__(self, other):
-        return not (self == other)
-
-    def __hash__(self):
-        return hash((self.host, self.port, self.pubkey))
-
 class LNTransportBase:
     reader: StreamReader
     writer: StreamWriter
     privkey: bytes
     peer_addr: Optional[LNPeerAddr] = None
 
+
 MSG_SIZE_LEN = {
     b'lightning': 2,
     b'electrum': 4,
 }
+
 
 class LNTransport(RSTransport):
 
     _privkey: bytes
     _remote_pubkey: bytes
 
-    def __init__(self, prologue, session_factory, privkey, peer_addr=None, whitelist=None):
+    def __init__(
+        self,
+        prologue: bytes,
+        session_factory,
+        privkey: bytes,
+        peer_addr: Optional[LNPeerAddr] = None,
+        whitelist=None
+    ):
         framer = QueueFramer()
         kind = SessionKind.SERVER if peer_addr is None else SessionKind.CLIENT
         self.peer_addr = peer_addr # todo: remove this, pass only pubkey
@@ -247,19 +138,19 @@ class LNTransport(RSTransport):
         self._data_received = asyncio.Event()
         self.handshake_done = asyncio.Event()
 
-    def is_listener(self):
+    def is_listener(self) -> bool:
         return self.kind == SessionKind.SERVER
 
     @log_exceptions
-    async def read_data(self, len):
+    async def read_data(self, length) -> bytes:
         await self._data_received.wait()
-        chunk = self._data[0:len]
-        self._data = self._data[len:]
+        chunk = self._data[0:length]
+        self._data = self._data[length:]
         if not self._data:
             self._data_received.clear()
         return chunk
 
-    async def write(self, message) -> None:
+    async def write(self, message: bytes) -> None:
         self.send_bytes(message)
 
     def send_bytes(self, msg: bytes) -> None:
@@ -376,7 +267,6 @@ class LNTransport(RSTransport):
         self.handshake_done.set()
         return rs
 
-
     def connection_made(self, transport):
         RSTransport.connection_made(self, transport)
         self._decrypt_messages_task = self.loop.create_task(self.decrypt_messages())
@@ -401,8 +291,10 @@ class LNTransport(RSTransport):
         self._asyncio_transport.write(msg)
         rspns = await self.read_data(2**10)
         if len(rspns) != 50:
-            raise HandshakeFailed(f"Lightning handshake act 1 response has bad length, "
-                                  f"are you sure this is the right pubkey? {self._remote_pubkey.hex()}")
+            raise HandshakeFailed(
+                f"Lightning handshake act 1 response has bad length, "
+                f"are you sure this is the right pubkey? {self._remote_pubkey.hex()}"
+            )
         hver, alice_epub, tag = rspns[0], rspns[1:34], rspns[34:]
         if bytes([hver]) != hs.handshake_version:
             raise HandshakeFailed("unexpected handshake version: {}".format(hver))
@@ -445,14 +337,21 @@ class LNTransport(RSTransport):
         return self._remote_pubkey
 
 
-
 class LNClient:
 
-    def __init__(self, prologue, privkey, session_factory, peer_addr, proxy=None, loop=None):
+    def __init__(
+        self,
+        prologue: bytes,
+        privkey: bytes,
+        session_factory,
+        peer_addr: LNPeerAddr,
+        proxy: Optional[ESocksProxy] = None,
+        loop=None
+    ):
         assert type(privkey) is bytes and len(privkey) == 32
         self.privkey = privkey
         self.peer_addr = peer_addr
-        self.proxy = MySocksProxy.from_proxy_dict(proxy) if proxy else None
+        self.proxy = proxy
         self.loop = loop or asyncio.get_running_loop()
         self.session_factory = session_factory
         self.protocol_factory = partial(LNTransport, prologue, self.session_factory, self.privkey, peer_addr=self.peer_addr)
@@ -469,11 +368,21 @@ class LNClient:
         await protocol.handshake_done.wait()
         return self.session
 
-    async def __aexit__(self, exc_type, exc_value, traceback):                                                                                                                                                            await self.session.close()
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.session.close()
 
 
-
-async def create_bolt8_server(prologue, privkey, whitelist, session_factory, host=None, port=None, *, loop=None, **kwargs):
+async def create_bolt8_server(
+    prologue,
+    privkey,
+    whitelist,
+    session_factory,
+    host=None,
+    port=None,
+    *,
+    loop=None,
+    **kwargs
+):
     loop = loop or asyncio.get_event_loop()
     protocol_factory = partial(LNTransport, prologue, session_factory, privkey, whitelist=whitelist)
     return await loop.create_server(protocol_factory, host, port)

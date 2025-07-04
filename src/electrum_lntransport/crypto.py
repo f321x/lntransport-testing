@@ -5,7 +5,7 @@ from hmac import digest as hmac_digest
 
 import electrum_ecc as ecc
 
-from .util import versiontuple
+from .util import versiontuple, get_bolt8_nonce_bytes
 
 
 _logger = logging.getLogger("electrum_lntransport")
@@ -112,3 +112,28 @@ def get_ecdh(priv: bytes, pub: bytes) -> bytes:
 
 def privkey_to_pubkey(priv: bytes) -> bytes:
     return ecc.ECPrivkey(priv[:32]).get_public_key_bytes()
+
+
+def create_ephemeral_key() -> (bytes, bytes):
+    privkey = ecc.ECPrivkey.generate_random_key()
+    return privkey.get_secret_bytes(), privkey.get_public_key_bytes()
+
+
+def aead_encrypt(key: bytes, nonce: int, associated_data: bytes, data: bytes) -> bytes:
+    nonce_bytes = get_bolt8_nonce_bytes(nonce)
+    return chacha20_poly1305_encrypt(
+        key=key,
+        nonce=nonce_bytes,
+        associated_data=associated_data,
+        data=data,
+    )
+
+
+def aead_decrypt(key: bytes, nonce: int, associated_data: bytes, data: bytes) -> bytes:
+    nonce_bytes = get_bolt8_nonce_bytes(nonce)
+    return chacha20_poly1305_decrypt(
+        key=key,
+        nonce=nonce_bytes,
+        associated_data=associated_data,
+        data=data,
+    )
