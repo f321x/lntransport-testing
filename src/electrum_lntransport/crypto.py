@@ -6,13 +6,13 @@ from hmac import digest as hmac_digest
 import electrum_ecc as ecc
 
 from .util import versiontuple, get_bolt8_nonce_bytes
+from .consts import MIN_CRYPTOGRAPHY_VERSION, MIN_CRYPTODOME_VERSION
 
 
 _logger = logging.getLogger("electrum_lntransport")
 
 
 HAS_CRYPTODOME = False
-MIN_CRYPTODOME_VERSION = "3.7"
 try:
     import Cryptodome
     if versiontuple(Cryptodome.__version__) < versiontuple(MIN_CRYPTODOME_VERSION):
@@ -26,7 +26,6 @@ else:
     HAS_CRYPTODOME = True
 
 HAS_CRYPTOGRAPHY = False
-MIN_CRYPTOGRAPHY_VERSION = "2.8"
 try:
     import cryptography
     if versiontuple(cryptography.__version__) < versiontuple(MIN_CRYPTOGRAPHY_VERSION):

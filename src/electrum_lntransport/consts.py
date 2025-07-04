@@ -1,0 +1,11 @@
+MSG_SIZE_LEN = {
+    b'lightning': 2,
+    b'electrum': 4,
+}
+
+NOISE_PROTOCOL_NAME = b"Noise_XK_secp256k1_ChaChaPoly_SHA256"
+BOLT8_HANDSHAKE_VERSION = b"\x00"
+
+MIN_CRYPTODOME_VERSION = "3.7"
+
+MIN_CRYPTOGRAPHY_VERSION = "2.8"

@@ -10,7 +10,7 @@ import asyncio
 from asyncio import Queue, StreamReader, StreamWriter
 
 from functools import cached_property, partial
-from typing import Optional
+from typing import Optional, Tuple
 
 from aiorpcx.session import SessionKind, SessionBase
 from aiorpcx.framing import FramerBase
@@ -21,6 +21,7 @@ import electrum_ecc as ecc
 from .crypto import (sha256, hmac_oneshot, get_ecdh, privkey_to_pubkey, create_ephemeral_key,
                      aead_encrypt, aead_decrypt)
 from .util import log_exceptions, LNPeerAddr, ESocksProxy
+from .consts import MSG_SIZE_LEN, NOISE_PROTOCOL_NAME, BOLT8_HANDSHAKE_VERSION
 
 
 class QueueFramer(FramerBase):
@@ -49,24 +50,25 @@ class LNSession(SessionBase):
 class LightningPeerConnectionClosed(Exception): pass
 class HandshakeFailed(Exception): pass
 
-class HandshakeState(object):
-    protocol_name = b"Noise_XK_secp256k1_ChaChaPoly_SHA256"
-    handshake_version = b"\x00"
 
-    def __init__(self, prologue, responder_pub):
+class HandshakeState:
+    protocol_name: bytes = NOISE_PROTOCOL_NAME
+    handshake_version: bytes = BOLT8_HANDSHAKE_VERSION
+
+    def __init__(self, prologue: bytes, responder_pub: bytes):
         self.prologue = prologue
         self.responder_pub = responder_pub
-        self.h = sha256(self.protocol_name)
-        self.ck = self.h
+        self.h = sha256(self.protocol_name)  # type: bytes
+        self.ck = self.h  # type: bytes
         self.update(self.prologue)
         self.update(self.responder_pub)
 
-    def update(self, data):
+    def update(self, data: bytes) -> bytes:
         self.h = sha256(self.h + data)
         return self.h
 
 
-def get_bolt8_hkdf(salt, ikm):
+def get_bolt8_hkdf(salt: bytes, ikm: bytes) -> Tuple[bytes, bytes]:
     """RFC5869 HKDF instantiated in the specific form
     used in Lightning BOLT 8:
     Extract and expand to 64 bytes using HMAC-SHA256,
@@ -74,7 +76,7 @@ def get_bolt8_hkdf(salt, ikm):
     Return as two 32 byte fields.
     """
     #Extract
-    prk = hmac_oneshot(salt, msg=ikm, digest=hashlib.sha256)
+    prk: bytes = hmac_oneshot(salt, msg=ikm, digest=hashlib.sha256)
     assert len(prk) == 32
     #Expand
     info = b""
@@ -85,7 +87,7 @@ def get_bolt8_hkdf(salt, ikm):
     return T1, T2
 
 
-def act1_initiator_message(hs, epriv, epub):
+def act1_initiator_message(hs: HandshakeState, epriv: bytes, epub: bytes) -> Tuple[bytes, bytes]:
     ss = get_ecdh(epriv, hs.responder_pub)
     ck2, temp_k1 = get_bolt8_hkdf(hs.ck, ss)
     hs.ck = ck2
@@ -97,21 +99,7 @@ def act1_initiator_message(hs, epriv, epub):
     return msg, temp_k1
 
 
-class LNTransportBase:
-    reader: StreamReader
-    writer: StreamWriter
-    privkey: bytes
-    peer_addr: Optional[LNPeerAddr] = None
-
-
-MSG_SIZE_LEN = {
-    b'lightning': 2,
-    b'electrum': 4,
-}
-
-
 class LNTransport(RSTransport):
-
     _privkey: bytes
     _remote_pubkey: bytes
 
@@ -137,15 +125,16 @@ class LNTransport(RSTransport):
         self._data = bytearray()
         self._data_received = asyncio.Event()
         self.handshake_done = asyncio.Event()
+        self._decrypt_messages_task = None  # type: Optional[asyncio.Task]
 
     def is_listener(self) -> bool:
         return self.kind == SessionKind.SERVER
 
     @log_exceptions
-    async def read_data(self, length) -> bytes:
+    async def read_data(self, length: int) -> bytes:
         await self._data_received.wait()
-        chunk = self._data[0:length]
-        self._data = self._data[length:]
+        chunk = self._data[:length]
+        del self._data[:length]
         if not self._data:
             self._data_received.clear()
         return chunk
@@ -213,7 +202,7 @@ class LNTransport(RSTransport):
         self.r_ck = ck
         self.s_ck = ck
 
-    async def listener_handshake(self, **kwargs):
+    async def listener_handshake(self, *, epriv: bytes = None):
         hs = HandshakeState(self.prologue, privkey_to_pubkey(self._privkey))
         act1 = b''
         while len(act1) < 50:
@@ -233,10 +222,9 @@ class LNTransport(RSTransport):
         _p = aead_decrypt(temp_k1, 0, h, c)
         hs.update(c)
         # act 2
-        if 'epriv' not in kwargs:
+        if epriv is None:
             epriv, epub = create_ephemeral_key()
         else:
-            epriv = kwargs['epriv']
             epub = ecc.ECPrivkey(epriv).get_public_key_bytes()
         hs.ck = ck
         hs.responder_pub = re
@@ -273,15 +261,19 @@ class LNTransport(RSTransport):
 
     def connection_lost(self, exc):
         RSTransport.connection_lost(self, exc)
-        self._process_messages_task.cancel() # fixme: this should be done in parent class
-        self._decrypt_messages_task.cancel()
+        if self._process_messages_task is not None:
+            self._process_messages_task.cancel() # fixme: this should be done in parent class
+            self._process_messages_task = None
+        if self._decrypt_messages_task is not None:
+            self._decrypt_messages_task.cancel()
+            self._decrypt_messages_task = None
 
-    def data_received(self, chunk):
+    def data_received(self, chunk: bytes) -> None:
         self._data += chunk
         self._data_received.set()
         self.session.data_received(chunk)
 
-    async def handshake(self):
+    async def handshake(self) -> None:
         assert self._remote_pubkey is not None
         hs = HandshakeState(self.prologue, self._remote_pubkey)
         # Get a new ephemeral key
@@ -327,11 +319,10 @@ class LNTransport(RSTransport):
 
     def name(self) -> str:
         pubkey = self.remote_pubkey()
-        if pubkey:
-            pubkey_hex = pubkey.hex() if pubkey else pubkey
-            return f"{pubkey_hex[:10]}-{self._id_hash[:8]}"
-        else:
+        if not pubkey:
             return ''
+        pubkey_hex = pubkey.hex() if pubkey else pubkey
+        return f"{pubkey_hex[:10]}-{self._id_hash[:8]}"
 
     def remote_pubkey(self) -> Optional[bytes]:
         return self._remote_pubkey
@@ -346,7 +337,7 @@ class LNClient:
         session_factory,
         peer_addr: LNPeerAddr,
         proxy: Optional[ESocksProxy] = None,
-        loop=None
+        loop: Optional[asyncio.EventLoop] = None,
     ):
         assert type(privkey) is bytes and len(privkey) == 32
         self.privkey = privkey
@@ -354,12 +345,22 @@ class LNClient:
         self.proxy = proxy
         self.loop = loop or asyncio.get_running_loop()
         self.session_factory = session_factory
-        self.protocol_factory = partial(LNTransport, prologue, self.session_factory, self.privkey, peer_addr=self.peer_addr)
+        self.protocol_factory = partial(
+            LNTransport,
+            prologue,
+            self.session_factory,
+            self.privkey,
+            peer_addr=self.peer_addr
+        )
 
     @log_exceptions
     async def create_connection(self):
         connector = self.proxy or self.loop
-        return await connector.create_connection(self.protocol_factory, self.peer_addr.host, self.peer_addr.port)
+        return await connector.create_connection(
+            self.protocol_factory,
+            self.peer_addr.host,
+            self.peer_addr.port
+        )
 
     async def __aenter__(self):
         _transport, protocol = await self.create_connection()
@@ -373,16 +374,21 @@ class LNClient:
 
 
 async def create_bolt8_server(
-    prologue,
-    privkey,
+    prologue: bytes,
+    privkey: bytes,
     whitelist,
     session_factory,
     host=None,
     port=None,
     *,
     loop=None,
-    **kwargs
 ):
     loop = loop or asyncio.get_event_loop()
-    protocol_factory = partial(LNTransport, prologue, session_factory, privkey, whitelist=whitelist)
+    protocol_factory = partial(
+        LNTransport,
+        prologue,
+        session_factory,
+        privkey,
+        whitelist=whitelist
+    )
     return await loop.create_server(protocol_factory, host, port)
