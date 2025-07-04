@@ -6,7 +6,7 @@ from hmac import digest as hmac_digest
 import electrum_ecc as ecc
 
 from .util import versiontuple, get_bolt8_nonce_bytes
-from .consts import MIN_CRYPTOGRAPHY_VERSION, MIN_CRYPTODOME_VERSION
+from .constants import MIN_CRYPTOGRAPHY_VERSION, MIN_CRYPTODOME_VERSION
 
 
 _logger = logging.getLogger("electrum_lntransport")

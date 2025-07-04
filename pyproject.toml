@@ -16,12 +16,6 @@ dependencies = [
     "electrum_ecc",
     "aiorpcx>=0.22.0,<0.26",
 ]
-
-[project.optional-dependencies]
-crypto = [
-    "cryptography>=2.8",
-]
-
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -38,6 +32,10 @@ classifiers = [
 ]
 dynamic = ['version']
 
+[project.optional-dependencies]
+crypto = [
+    "cryptography>=2.8",
+]
 
 #[project.urls]
 #Homepage = "https://github.com/spesmilo/electrum-lntransport"

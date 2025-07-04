@@ -7,7 +7,7 @@
 
 import hashlib
 import asyncio
-from asyncio import Queue, StreamReader, StreamWriter
+from asyncio import Queue
 
 from functools import cached_property, partial
 from typing import Optional, Tuple
@@ -21,7 +21,7 @@ import electrum_ecc as ecc
 from .crypto import (sha256, hmac_oneshot, get_ecdh, privkey_to_pubkey, create_ephemeral_key,
                      aead_encrypt, aead_decrypt)
 from .util import log_exceptions, LNPeerAddr, ESocksProxy
-from .consts import MSG_SIZE_LEN, NOISE_PROTOCOL_NAME, BOLT8_HANDSHAKE_VERSION
+from .constants import MSG_SIZE_LEN, NOISE_PROTOCOL_NAME, BOLT8_HANDSHAKE_VERSION
 
 
 class QueueFramer(FramerBase):
